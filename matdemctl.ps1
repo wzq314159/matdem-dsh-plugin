@@ -3,11 +3,16 @@
 # Commands:
 #   win                - list all top-level windows whose process name is MatDEM (JSON)
 #   fg <hwnd>          - restore + foreground the given window
+#   top <hwnd>         - pin window to TOPMOST (blocks other topmost windows)
+#   untop <hwnd>       - release TOPMOST pin
+#   min <hwnd>         - minimize a window
 #   rect <hwnd>        - print "x,y,w,h" of the window's screen rect
 #   shot <png> <hwnd>  - screenshot the window client area into png (1x)
-#   ocr <png>          - OCR a png, print one JSON line per text line {t,x,y,w,h} (scaled 2x internally)
+#   ocr <png> [scale]  - OCR a png, print one JSON line per text line {t,x,y,w,h};
+#                        scale (default 1) upscales before recognition, coords stay in original px
 #   click <x> <y>      - move the mouse and left-click at screen coords
 #   dblclick <x> <y>   - double left-click
+#   pclick <hwnd> <wx> <wy> - PostMessage click (window-rect coords, bypasses Z-order occlusion)
 #   type <text>        - type text (UTF-16 unicode keystrokes) into the focused window
 #   key <name>         - send special keys: enter tab esc f5 home end up down left right ctrl+a ctrl+s ...
 param(
@@ -32,11 +37,14 @@ public class MDWin {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
   public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
   public static string[] List() {
@@ -71,6 +79,40 @@ public class MDWin {
   }
 
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+  // Temporarily pin a window to TOPMOST so clicks/screenshots are not
+  // swallowed by other topmost windows (e.g. fullscreen browsers).
+  public static void Top(IntPtr h) {
+    SetWindowPos(h, (IntPtr)(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); // HWND_TOPMOST
+  }
+
+  public static void UnTop(IntPtr h) {
+    SetWindowPos(h, (IntPtr)(-2), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010); // HWND_NOTOPMOST
+  }
+
+  public static void Min(IntPtr h) {
+    ShowWindow(h, 6); // SW_MINIMIZE
+  }
+
+  public static bool IsMinimized(IntPtr h) {
+    return IsIconic(h);
+  }
+
+  // PostMessage mouse click directly to a window: bypasses Z-order occlusion.
+  // Takes window-client coordinates; converts them from window-rect coords.
+  public static void PClick(IntPtr h, int wx, int wy) {
+    // wx, wy are relative to the window rect (same space as shot coordinates).
+    // Convert to client coordinates via the client-area origin on screen.
+    POINT origin = new POINT(); origin.X = 0; origin.Y = 0;
+    ClientToScreen(h, ref origin);
+    RECT r; GetWindowRect(h, out r);
+    int lparamX = r.Left + wx - origin.X;
+    int lparamY = r.Top + wy - origin.Y;
+    IntPtr lParam = (IntPtr)((lparamY << 16) | (lparamX & 0xFFFF));
+    PostMessage(h, 0x0201, (IntPtr)1, lParam); // WM_LBUTTONDOWN
+    System.Threading.Thread.Sleep(60);
+    PostMessage(h, 0x0202, (IntPtr)0, lParam); // WM_LBUTTONUP
+  }
 
   public static void Wheel(int x, int y, int clicks) {
     SetCursorPos(x, y);
@@ -226,6 +268,30 @@ switch ($Cmd) {
     [MDWin]::ToFront($h)
     Write-Output 'ok'
   }
+  'top' {
+    # top <hwnd> - pin window to TOPMOST (blocks other topmost windows)
+    $h = [IntPtr][int64]$Args[0]
+    [MDWin]::Top($h)
+    Write-Output 'ok'
+  }
+  'untop' {
+    # untop <hwnd> - release TOPMOST pin
+    $h = [IntPtr][int64]$Args[0]
+    [MDWin]::UnTop($h)
+    Write-Output 'ok'
+  }
+  'min' {
+    # min <hwnd> - minimize a window
+    $h = [IntPtr][int64]$Args[0]
+    [MDWin]::Min($h)
+    Write-Output 'ok'
+  }
+  'pclick' {
+    # pclick <hwnd> <wx> <wy> - PostMessage click (window-rect coords, bypasses Z-order)
+    $h = [IntPtr][int64]$Args[0]
+    [MDWin]::PClick($h, [int]$Args[1], [int]$Args[2])
+    Write-Output 'ok'
+  }
   'rect' {
     $h = [IntPtr][int64]$Args[0]
     $r = New-Object MDWin+RECT
@@ -250,7 +316,11 @@ switch ($Cmd) {
     Write-Output "$($r.Left),$($r.Top),$w,$ht"
   }
   'ocr' {
+    # ocr <png> [scale] - OCR a png; scale (default 1) upscales before recognition.
+    # Output coordinates are in ORIGINAL png pixels regardless of scale.
     $png = $Args[0]
+    $scale = 1
+    if ($Args.Count -ge 2) { $scale = [int]$Args[1]; if ($scale -lt 1) { $scale = 1 } }
     $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
     $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
     $null = [Windows.Storage.StorageFile, Windows.Foundation, ContentType = WindowsRuntime]
@@ -267,6 +337,12 @@ switch ($Cmd) {
     $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
     $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
     $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    if ($scale -gt 1) {
+      $transform = New-Object Windows.Graphics.Imaging.BitmapTransform
+      $transform.ScaledWidth = [uint32]($decoder.PixelWidth * $scale)
+      $transform.ScaledHeight = [uint32]($decoder.PixelHeight * $scale)
+      $bitmap = Await ($decoder.GetSoftwareBitmapAsync($decoder.BitmapPixelFormat, $decoder.BitmapAlphaMode, $transform, [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation, [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage)) ([Windows.Graphics.Imaging.SoftwareBitmap])
+    }
     $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage((New-Object Windows.Globalization.Language 'zh-Hans-CN'))
     $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
     $out = @()
@@ -278,8 +354,8 @@ switch ($Cmd) {
       foreach ($wd in $words) { $ws += $wd.Text }
       $out += [PSCustomObject]@{
         t = ($ws -join ' ')
-        x = [int]$rect.X; y = [int]$rect.Y
-        w = [int]$rect.Width; h = [int]$rect.Height
+        x = [int]($rect.X / $scale); y = [int]($rect.Y / $scale)
+        w = [int]($rect.Width / $scale); h = [int]($rect.Height / $scale)
       }
     }
     Write-Json $out

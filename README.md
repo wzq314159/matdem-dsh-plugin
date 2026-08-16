@@ -7,7 +7,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `matdemctl.ps1` | GUI 自动化原语工具（窗口枚举/置前、截图、中文 OCR、鼠标点击/双击/滚轮、PostMessage 键盘、文件 mtime 查询）。被 Host 半部调用。 |
+| `matdemctl.ps1` | GUI 自动化原语工具（窗口枚举/置前/置顶/最小化、截图、中文 OCR、鼠标点击/双击/滚轮、PostMessage 键盘与鼠标点击、文件 mtime 查询）。被 Host 半部调用。 |
 | `matdem-plugin-host.js` | 插件 Host 半部源码（Node 侧）：9 个模型工具 + 9 个 Client RPC 处理器 |
 | `matdem-plugin-client.js` | 插件 Client 半部源码（浏览器侧）：运行卡片里的控制面板 |
 | `README.md` | 本说明 |
@@ -17,6 +17,17 @@
 > 恢复方式：在 DSH 中把 host/client 源码重新 `cordis_define` 为插件，
 > 并把 `matdemctl.ps1` 放到 MatDEM 根目录（插件会检测它）。
 
+## 部署可移植性（pkg-14）
+
+- **安装目录检测**：插件依次尝试 `MATDEM_HOME` 环境变量 → 常见安装布局
+  （`E:\matdem`、`D:\matdem` 下的 `MatDEM5.11(Win&Linux)` 及
+  `D:\matdem\5.11\MatDEM5.11(Win&Linux)` 等二级目录）→ 回退递归扫描
+  E:/D:/C: 盘 matdem 目录下全部子目录（≤2 层）。无需修改代码即可换机使用。
+- **截图目录**：跟随检测到的 MatDEM 目录（`<dir>\.dsh-matdem`），不依赖 E 盘。
+- **窗口遮挡**：运行/启动前将目标窗口临时置顶（TOPMOST），结束后恢复；
+  物理点击被吞时回退 PostMessage 点击（`pclick`）。
+- **长任务**：默认超时 15 分钟；输出条持续有新行时自动顺延 30 秒，不会误超时。
+
 ## 版本记录
 
 | 版本 | 内容 |
@@ -25,6 +36,7 @@
 | pkg-11 (final4) | mtime 完成检测细化（TempModel 文件 mtime 晚于运行开始） |
 | pkg-12 (final5) | **模态对话框自动关闭**（dismissDialogs/findModalDialog/dismissOne：优先点 取消/否，回退 确定/关闭，最后点右下角；运行前清理残留对话框，运行后弹出提示对话框时关闭并重新点击运行按钮）+ **文件行 OCR 归一化**（fileNorm：全角数字/〇囗口→0、。．·→.、℃→c、去非 ASCII，仅用于面板行匹配） |
 | pkg-13 | Levenshtein 模糊行匹配（容忍 OCR 数字/字母混淆，如 EQv5→EQv6）、安全对话框关闭策略细化（跳过 figure/图 标题、大窗口） |
+| **pkg-14（可移植性/鲁棒性大版本）** | 依据另一台设备（MatDEM 装在 `D:\matdem\5.11\...`）实测反馈优化：① `detectDir` 支持 `MATDEM_HOME` 环境变量 + 常见安装布局（E:/D:/C: 盘 matdem 二级目录）+ 回退递归扫描候选盘符（≤2 层）；② scratch 截图目录跟随检测目录（不再硬编码 E 盘）；③ 运行/启动前**临时置顶目标窗口**（TOPMOST），结束后恢复，防止全屏 topmost 浏览器吞点击/污染 OCR；④ 完成检测支持**任意 SunAwt\* 小对话框**（含 SunAwtDialog，如 msgbox 结果框），先 OCR 读取对话框内容并入输出再关闭；⑤ 文件行匹配增加**共享 ≥6 字符连续子串**兜底；⑥ 文件行点击固定 **y+5 偏移**（避免点到下一行）；⑦ "运行以上命令"按钮增加宽松变体 + 相对坐标兜底（OCR 严重混淆时）；⑧ 默认运行超时 **15 分钟**，输出条持续增长自动顺延；⑨ matdemctl 新增 `top`/`untop`/`min`/`pclick` 命令（pclick = PostMessage 点击，绕 Z 序遮挡）、`ocr` 支持缩放参数 |
 
 > 注：源码仓库中的文件即为最新版（host 34275B / client 6309B / matdemctl 14472B / README 7417B），
 > 实际运行以 DSH 会话中 `cordis_define` 的包为准。
@@ -35,7 +47,7 @@
 - `matdem_launch` — 启动 MatDEM.exe，自动点击"主程序"进入编辑器主窗口（enterMain=false 停在启动页）
 - `matdem_scripts` — 列出根目录 + examples* 的全部 .m 脚本
 - `matdem_read_script` / `matdem_write_script` — 读写 .m 脚本
-- `matdem_run_script` — **全自动运行**：进入主程序 → 文件管理器导航 → 双击载入脚本 → 点击"运行以上命令" → 轮询完成（输出条消息 / 新图形窗口 / TempModel 文件 mtime 变化）
+- `matdem_run_script` — **全自动运行**：进入主程序 → 文件管理器导航 → 双击载入脚本 → 点击"运行以上命令" → 轮询完成（输出条消息 / 新图形窗口 / TempModel 文件 mtime 变化 / msgbox 结果对话框，对话框内容自动捕获入输出）
 - `matdem_output` — OCR 读取底部"输出消息"条
 - `matdem_results` — 列出结果文件（根目录 PNG/GIF、TempModel/ 和 data/ 的 .mat）
 - `matdem_close` — 强杀 MatDEM 进程树（释放 GPU）

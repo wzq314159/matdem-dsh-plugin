@@ -1,6 +1,7 @@
 /**
  * MatDEM 5.11 集成插件 — Host 半部（DSH 动态 Cordis 插件）
- * matdem-1 / pkg-12 (final5: 模态对话框自动关闭 + 文件行OCR归一化)
+ * matdem-1 / pkg-14 (portable: MATDEM_HOME env, multi-drive scan, topmost
+ *   pin vs occlusion, SunAwtDialog completion, substring row match, pclick)
  *
  * 功能：把本机 MatDEM 5.11 离散元程序接入 DSH。
  *  - matdem_status      环境检测（目录/MCR 9.14/GPU/运行状态）
@@ -13,6 +14,21 @@
  *  - matdem_close       强杀 MatDEM 进程
  *
  * 依赖：matdemctl.ps1（同目录），Windows PowerShell 5.1，MATLAB Runtime R2023a (9.14)
+ *
+ * pkg-14 可移植性改进（依据另一台设备实测反馈）：
+ *  1. detectDir：MATDEM_HOME 环境变量优先；常见安装布局（E:/D:/C: 盘 matdem
+ *     目录及二级布局如 D:\matdem\5.11\MatDEM5.11(Win&Linux)）；回退扫描候选盘符
+ *     下全部子目录（≤2 层）。
+ *  2. scratchDir 跟随检测到的 MatDEM 目录（<dir>\.dsh-matdem），不再硬编码 E 盘。
+ *  3. 启动/运行前将目标窗口临时置顶（top），结束后恢复（untop），防止全屏
+ *     topmost 浏览器吞点击 / 污染 OCR。
+ *  4. 完成检测支持任意 SunAwt* 小对话框（含 SunAwtDialog，如 msgbox 结果框）：
+ *     先 OCR 读取对话框内容并入输出，再关闭（确定/OK → 右下角 → pclick）。
+ *  5. 文件行匹配增加"共享 ≥6 字符连续子串"兜底；行点击固定 y+5 偏移。
+ *  6. "运行以上命令"按钮增加宽松变体 + 相对坐标兜底。
+ *  7. 默认运行超时 15 分钟，输出条持续有新行时自动顺延。
+ *  8. matdemctl 新增 top/untop/min/pclick 命令（pclick 为 PostMessage 点击，
+ *     绕过 Z 序遮挡，lParam 用客户区坐标）。
  */
 return {
   inject: ['timer'],
@@ -70,41 +86,84 @@ return {
     const PWSH = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
     const TASKKILL = 'C:\\Windows\\System32\\taskkill.exe'
     const REG = 'C:\\Windows\\System32\\reg.exe'
-    const scratchDir = 'E:\\matdem\\.dsh-matdem'
+
+    // scratch dir is resolved per-detected-dir (no hardcoded drive).
+    // <matdemDir>\.dsh-matdem  (matdemctl shot auto-creates the parent)
+    let scratchDir = null
+    const scratchFor = async function () {
+      if (scratchDir) return scratchDir
+      const dir = await detectDir()
+      scratchDir = dir ? join(dir, '.dsh-matdem') : (process.env.TEMP || 'C:\\Windows\\Temp')
+      return scratchDir
+    }
 
     let matdemDir = null
     let detectPromise = null
     let launchedHandle = null
 
+    // isMatdemDir(r): true when r\MatDEM.exe exists
+    const isMatdemDir = async function (r) {
+      try {
+        const exe = await fsService.stat(await fsService.resolve(join(r, 'MatDEM.exe')))
+        return !!(exe && exe.type === 'file')
+      } catch (e) { return false }
+    }
+
     const detectDir = async function () {
       if (detectPromise) return detectPromise
       detectPromise = (async function () {
-        const roots = [
-          'E:\\matdem\\MATDEM5.11\\MatDEM\\MatDEM5.11(Win&Linux)',
-          'E:\\matdem', 'D:\\matdem', 'C:\\matdem'
-        ]
-        for (let i = 0; i < roots.length; i++) {
-          const r = roots[i]
-          try {
-            const t = await fsService.resolve(r)
-            const st = await fsService.stat(t)
-            if (!st || st.type !== 'directory') continue
-            const exe = await fsService.stat(await fsService.resolve(join(r, 'MatDEM.exe')))
-            if (exe && exe.type === 'file') return r
-          } catch (e) { /* next */ }
-        }
+        // 0) MATDEM_HOME environment variable (explicit user override)
         try {
-          const rootT = await fsService.resolve('E:\\matdem')
-          const entries = await fsService.listDir(rootT)
-          for (let i = 0; i < entries.length; i++) {
-            const e = entries[i]
-            if (e.type !== 'directory') continue
-            try {
-              const exe = await fsService.stat(await fsService.resolve(join('E:\\matdem', e.name, 'MatDEM.exe')))
-              if (exe && exe.type === 'file') return join('E:\\matdem', e.name)
-            } catch (e2) { /* next */ }
+          const r = await sys(['cmd', '/c', 'echo', '%MATDEM_HOME%'], 10000)
+          const env = String(r.stdout || '').trim()
+          if (env && env.length > 2 && env.indexOf('%MATDEM_HOME%') < 0) {
+            if (await isMatdemDir(env)) return env
           }
-        } catch (e3) { /* ignore */ }
+        } catch (e) { /* next */ }
+        // 1) known layouts across common drives (root dirs and one level of
+        //    version subdirs, e.g. D:\matdem\5.11\MatDEM5.11(Win&Linux))
+        const roots = ['E:\\matdem', 'D:\\matdem', 'C:\\matdem']
+        const direct = [
+          'E:\\matdem\\MATDEM5.11\\MatDEM\\MATDEM5.11(Win&Linux)',
+          'E:\\matdem\\MatDEM5.11\\MatDEM\\MatDEM5.11(Win&Linux)',
+          'D:\\matdem\\5.11\\MatDEM5.11(Win&Linux)',
+          'D:\\matdem\\MATDEM5.11\\MatDEM\\MatDEM5.11(Win&Linux)',
+          'D:\\matdem\\MatDEM5.11\\MatDEM\\MatDEM5.11(Win&Linux)',
+          'C:\\matdem\\MATDEM5.11\\MatDEM\\MatDEM5.11(Win&Linux)'
+        ]
+        for (let i = 0; i < direct.length; i++) {
+          if (await isMatdemDir(direct[i])) return direct[i]
+        }
+        // 2) fallback: recursive scan of candidate drives, depth <= 2
+        for (let i = 0; i < roots.length; i++) {
+          const base = roots[i]
+          let baseOk = false
+          try {
+            const t = await fsService.resolve(base)
+            const st = await fsService.stat(t)
+            baseOk = !!(st && st.type === 'directory')
+          } catch (e) { baseOk = false }
+          if (!baseOk) continue
+          if (await isMatdemDir(base)) return base
+          try {
+            const lvl1 = await fsService.listDir(await fsService.resolve(base))
+            for (let j = 0; j < lvl1.length; j++) {
+              const e1 = lvl1[j]
+              if (e1.type !== 'directory') continue
+              const p1 = join(base, e1.name)
+              if (await isMatdemDir(p1)) return p1
+              try {
+                const lvl2 = await fsService.listDir(await fsService.resolve(p1))
+                for (let k = 0; k < lvl2.length; k++) {
+                  const e2 = lvl2[k]
+                  if (e2.type !== 'directory') continue
+                  const p2 = join(p1, e2.name)
+                  if (await isMatdemDir(p2)) return p2
+                }
+              } catch (e2) { /* next */ }
+            }
+          } catch (e1) { /* next */ }
+        }
         return null
       })()
       return detectPromise
@@ -202,11 +261,13 @@ return {
     }
 
     let shotSeq = 0
-    const ocrWindow = async function (win) {
+    const ocrWindow = async function (win, scale) {
       shotSeq++
-      const png = join(scratchDir, 'shot-' + shotSeq + '.png')
+      const png = join(await scratchFor(), 'shot-' + shotSeq + '.png')
       await ctl(['shot', png, String(win.hwnd)], 30000)
-      const out = await ctl(['ocr', png], 60000)
+      const args = ['ocr', png]
+      if (scale && scale > 1) args.push(String(scale))
+      const out = await ctl(args, 60000)
       let lines = []
       try { lines = JSON.parse(out) } catch (e) { lines = [] }
       return { lines: lines, rect: { x: win.x, y: win.y, w: win.w, h: win.h } }
@@ -228,7 +289,9 @@ return {
     // find a file/folder row in the right file-manager panel (tree at y>12%h,
     // file rows below). Exact (contains) matches win by longest text; otherwise
     // a fuzzy (Levenshtein) fallback tolerates common OCR digit/letter
-    // confusions (e.g. EQv5 read as EQv6, makeGIF read as makeGlF).
+    // confusions (e.g. EQv5 read as EQv6, makeGIF read as makeGlF). Finally a
+    // shared-substring fallback (>=6 chars) rescues heavily garbled rows such
+    // as "ScxTestS m" vs user_BoxTestSpeed (share "xtests").
     const findPanelRow = function (ocr, nameNorm) {
       const win = ocr.rect
       const nn = stripM(fileNorm(nameNorm))
@@ -249,6 +312,19 @@ return {
           const minLen = Math.min(nn.length, t.length)
           if (dist <= 1 || (minLen >= 4 && dist / minLen <= 0.25)) {
             score = 200 - dist * 10 + Math.min(t.length, 10)
+          } else {
+            // shared contiguous substring >= 6 chars (handles heavy OCR damage)
+            let shared = 0
+            const lim = Math.min(t.length, nn.length)
+            for (let ln = Math.min(lim, 12); ln >= 6; ln--) {
+              for (let s = 0; s + ln <= t.length; s++) {
+                if (nn.indexOf(t.substr(s, ln)) >= 0) { shared = ln; break }
+              }
+              if (shared) break
+            }
+            if (shared >= 6) {
+              score = 150 + shared
+            }
           }
         }
         if (score > bestScore) {
@@ -259,18 +335,22 @@ return {
       return best
     }
 
-    const clickAt = async function (win, l) {
+    const clickAt = async function (win, l, offY) {
       const cx = win.x + l.x + Math.floor((l.w || 40) / 2)
-      const cy = win.y + l.y + Math.floor((l.h || 14) / 2)
+      const cy = win.y + l.y + (offY != null ? offY : Math.floor((l.h || 14) / 2))
       await ctl(['click', String(cx), String(cy)], 15000)
       return { x: cx, y: cy }
     }
-    const dblClickAt = async function (win, l) {
+    // File rows: OCR line height (~6px) is much smaller than the real row pitch
+    // (~14-16px); clicking at (h+14)/2 lands on the NEXT row. Use a small fixed
+    // offset (y+5) for panel rows, keep centered click for buttons.
+    const dblClickAt = async function (win, l, offY) {
       const cx = win.x + l.x + Math.floor((l.w || 40) / 2)
-      const cy = win.y + l.y + Math.floor((l.h || 14) / 2)
+      const cy = win.y + l.y + (offY != null ? offY : Math.floor((l.h || 14) / 2))
       await ctl(['dblclick', String(cx), String(cy)], 15000)
       return { x: cx, y: cy }
     }
+    const panelClickOffset = 5
 
     // ---------- business actions ----------
     const mcrInfo = async function () {
@@ -327,6 +407,23 @@ return {
       }
     }
 
+    // Pin target window to TOPMOST so physical clicks are not swallowed by
+    // other topmost windows (e.g. fullscreen browsers) and screenshots are not
+    // polluted. Callers should unpin in a finally block.
+    const pinTop = async function (hwnd) {
+      try { await ctl(['top', String(hwnd)], 10000) } catch (e) { /* old matdemctl may lack it */ }
+    }
+    const unpinTop = async function (hwnd) {
+      try { await ctl(['untop', String(hwnd)], 10000) } catch (e) { /* ignore */ }
+    }
+    // PostMessage click fallback: bypasses Z-order occlusion entirely.
+    const pclickAt = async function (win, wx, wy) {
+      try {
+        await ctl(['pclick', String(win.hwnd), String(wx), String(wy)], 15000)
+        return true
+      } catch (e) { return false }
+    }
+
     const launch = async function (enterMain) {
       const dir = await detectDir()
       if (!dir) throw new Error('MatDEM directory not found')
@@ -339,16 +436,22 @@ return {
         win = await waitForMainWindow(120000)
         if (!win) throw new Error('MatDEM window did not appear within 120s')
       }
-      if (enterMain !== false) {
-        await ctl(['fg', String(win.hwnd)], 10000)
-        await ctx.timer.timeout(1500)
-        const ocr = await ocrWindow(win)
-        const mainBtn = findLine(ocr.lines, ['主程序'])
-        if (mainBtn && norm(mainBtn.t).indexOf('主程序') >= 0) {
-          await clickAt(win, mainBtn)
-          await ctx.timer.timeout(10000)
-          win = await findMainWindow()
+      let pinned = false
+      try {
+        if (enterMain !== false) {
+          await pinTop(win.hwnd); pinned = true
+          await ctl(['fg', String(win.hwnd)], 10000)
+          await ctx.timer.timeout(1500)
+          const ocr = await ocrWindow(win)
+          const mainBtn = findLine(ocr.lines, ['主程序'])
+          if (mainBtn && norm(mainBtn.t).indexOf('主程序') >= 0) {
+            await clickAt(win, mainBtn)
+            await ctx.timer.timeout(10000)
+            win = await findMainWindow()
+          }
         }
+      } finally {
+        if (pinned && win) await unpinTop(win.hwnd)
       }
       return {
         launched: true,
@@ -440,19 +543,52 @@ return {
     // ---------- GUI automation ----------
     // dismiss one modal dialog window. Prefer 取消/否/No (do NOT confirm
     // exit), fall back to 确定/关闭/好, last resort click bottom-right area.
+    // Returns the OCR text of the dialog (may carry result data, e.g. a
+    // msgbox with "Your MatDEM Score is ...").
     const dismissOne = async function (w) {
-      await ctl(['fg', String(w.hwnd)], 10000)
-      await ctx.timer.timeout(600)
-      const ocr = await ocrWindow(w)
-      const cancel = findLine(ocr.lines, ['取消', '否', 'cancel', 'no'])
-      const ok = findLine(ocr.lines, ['确定', 'ok', 'yes', '关闭', '好'])
-      const btn = cancel || ok
-      if (btn) {
-        await clickAt(w, btn)
-      } else {
-        await ctl(['click', String(w.x + Math.floor(w.w * 0.75)), String(w.y + Math.floor(w.h * 0.82))], 10000)
-      }
+      let text = ''
+      try {
+        await ctl(['fg', String(w.hwnd)], 10000)
+        await ctx.timer.timeout(600)
+        const ocr = await ocrWindow(w)
+        text = ocr.lines.map(function (l) { return l.t }).join('\n')
+        const cancel = findLine(ocr.lines, ['取消', '否', 'cancel', 'no'])
+        const ok = findLine(ocr.lines, ['确定', 'ok', 'yes', '关闭', '好'])
+        const btn = cancel || ok
+        if (btn) {
+          try {
+            await clickAt(w, btn)
+          } catch (e) {
+            // physical click may be swallowed by occlusion; fall back to
+            // PostMessage click (window-rect coords)
+            await pclickAt(w, btn.x + Math.floor((btn.w || 40) / 2), btn.y + Math.floor((btn.h || 14) / 2))
+          }
+        } else {
+          try {
+            await ctl(['click', String(w.x + Math.floor(w.w * 0.75)), String(w.y + Math.floor(w.h * 0.82))], 10000)
+          } catch (e) {
+            await pclickAt(w, Math.floor(w.w * 0.75), Math.floor(w.h * 0.82))
+          }
+        }
+      } catch (e) { /* ignore */ }
       await ctx.timer.timeout(800)
+      return text
+    }
+
+    // Is a window a plausible small modal dialog? Accept ANY SunAwt* class
+    // (SunAwtFrame, SunAwtDialog, ...), small size, not minimized, not the
+    // start page / main program / figure windows.
+    const isSmallDialog = function (w, main) {
+      if (!w.visible) return false
+      if (w.cls.indexOf('SunAwt') !== 0) return false
+      if (main && w.hwnd === main.hwnd) return false
+      const title = String(w.title || '')
+      if (title.indexOf('矩阵离散元') >= 0) return false
+      if (/matdem主程序/i.test(title)) return false
+      if (/figure|图/i.test(title)) return false
+      if (w.w < 100 || w.h < 30) return false   // minimized / stray slivers
+      if (w.w >= 600 && w.h >= 400) return false
+      return true
     }
 
     const dismissDialogs = async function () {
@@ -461,25 +597,29 @@ return {
         const ws = await listWindows()
         for (let i = 0; i < ws.length; i++) {
           const w = ws[i]
-          if (!w.visible || w.cls !== 'SunAwtFrame') continue
-          if (main && w.hwnd === main.hwnd) continue
-          const title = String(w.title || '')
-          if (title.indexOf('矩阵离散元') >= 0) continue
-          if (/matdem主程序/i.test(title)) continue
-          if (/figure|图/i.test(title)) continue
-          if (w.w >= 600 && w.h >= 400) continue
+          if (!isSmallDialog(w, main)) continue
           await dismissOne(w)
         }
       } catch (e) { /* ignore */ }
     }
 
-    // find a currently open modal 提示 dialog (e.g. the 退出? prompt that
-    // can linger after a restart or pop up right after clicking 运行以上命令)
+    // find a currently open modal dialog (e.g. a 提示/退出? prompt that can
+    // linger after a restart, or a msgbox result dialog). Returns
+    // { w, text } where text is the dialog OCR content (may contain results).
     const findModalDialog = async function () {
       const ws = await listWindows()
-      return ws.find(function (w) {
-        return w.visible && w.cls === 'SunAwtFrame' && String(w.title || '').indexOf('提示') >= 0 && w.w < 600 && w.h < 400
-      }) || null
+      const main = await findMainWindow()
+      for (let i = 0; i < ws.length; i++) {
+        const w = ws[i]
+        if (!isSmallDialog(w, main)) continue
+        let text = ''
+        try {
+          const ocr = await ocrWindow(w)
+          text = ocr.lines.map(function (l) { return l.t }).join('\n')
+        } catch (e) { /* ignore */ }
+        return { w: w, text: text }
+      }
+      return null
     }
 
     const ensureMainWindow = async function () {
@@ -490,20 +630,27 @@ return {
         win = await waitForMainWindow(120000)
         if (!win) throw new Error('MatDEM window unavailable')
       }
-      await ctl(['fg', String(win.hwnd)], 10000)
-      await ctx.timer.timeout(1200)
-      let ocr = await ocrWindow(win)
-      const mainBtn = findLine(ocr.lines, ['主程序'])
-      if (mainBtn) {
-        await clickAt(win, mainBtn)
-        await ctx.timer.timeout(10000)
-        win = await findMainWindow()
-        if (!win) throw new Error('main program window did not open')
+      let pinned = false
+      try {
+        await pinTop(win.hwnd); pinned = true
         await ctl(['fg', String(win.hwnd)], 10000)
-        await ctx.timer.timeout(1500)
-        ocr = await ocrWindow(win)
+        await ctx.timer.timeout(1200)
+        let ocr = await ocrWindow(win)
+        const mainBtn = findLine(ocr.lines, ['主程序'])
+        if (mainBtn) {
+          await clickAt(win, mainBtn)
+          await ctx.timer.timeout(10000)
+          win = await findMainWindow()
+          if (!win) throw new Error('main program window did not open')
+          await ctl(['fg', String(win.hwnd)], 10000)
+          await ctx.timer.timeout(1500)
+          ocr = await ocrWindow(win)
+        }
+        return { win: win, ocr: ocr, unpin: function () { return unpinTop(win.hwnd) } }
+      } catch (e) {
+        if (pinned && win) await unpinTop(win.hwnd)
+        throw e
       }
-      return { win: win, ocr: ocr }
     }
 
     // snapshot TempModel files with mtimes (unix seconds)
@@ -517,6 +664,9 @@ return {
     }
 
     const runScript = async function (script, timeoutMs, wait) {
+      // Long benchmarks (e.g. BoxTestSpeed) take ~13 minutes; default to 15 min.
+      // If the output strip keeps growing, the deadline extends automatically.
+      const baseTimeout = timeoutMs || 900000
       const dir = await detectDir()
       if (!dir) throw new Error('MatDEM directory not found')
       const rel = String(script).replace(/\\/g, '/')
@@ -552,7 +702,7 @@ return {
             tries++
           }
           if (!row) throw new Error('folder not visible in file manager: ' + parts[pi])
-          await dblClickAt(win, row)
+          await dblClickAt(win, row, panelClickOffset)
           await ctx.timer.timeout(3000)
           ocr = await ocrWindow(win)
         }
@@ -575,7 +725,7 @@ return {
 
         let loaded = null
         for (let attemptN = 0; attemptN < 3 && !loaded; attemptN++) {
-          await dblClickAt(win, row)
+          await dblClickAt(win, row, panelClickOffset)
           await ctx.timer.timeout(2500)
           ocr = await ocrWindow(win)
           loaded = findLine(ocr.lines, ['commandisloadedfrom'].concat(baseTargets))
@@ -602,11 +752,14 @@ return {
       await ctl(['fg', String(win.hwnd)], 10000)
       await ctx.timer.timeout(1200)
       ocr = await ocrWindow(win)
+      // OCR of this fixed-layout button is often garbled (运行以上命令 ->
+      // "运 厅 上 翕 令"); try exact, then loose variants, then a relative
+      // layout fallback based on the main window rect.
       let runBtn = findLine(ocr.lines, ['运行以上命令'])
       if (!runBtn) {
         await ctx.timer.timeout(2000)
         ocr = await ocrWindow(win)
-        runBtn = findLine(ocr.lines, ['运行以上命令'])
+        runBtn = findLine(ocr.lines, ['运行以上命令', '以上命令', '运行'])
       }
       if (!runBtn) {
         const hasEditor = findLine(ocr.lines, ['命令编辑器', '编辑器'])
@@ -619,14 +772,33 @@ return {
           await ctl(['fg', String(win.hwnd)], 10000)
           await ctx.timer.timeout(1200)
           ocr = await ocrWindow(win)
-          runBtn = findLine(ocr.lines, ['运行以上命令'])
+          runBtn = findLine(ocr.lines, ['运行以上命令', '以上命令', '运行'])
+          if (!runBtn && win) {
+            // relative-position fallback (button sits below the editor panel)
+            await pclickAt(win, Math.floor(win.w * 0.34), Math.floor(win.h * 0.73))
+            await ctx.timer.timeout(2500)
+            ocr = await ocrWindow(win)
+            runBtn = findLine(ocr.lines, ['命令编辑器', '编辑器']) ? { x: -1, y: -1, w: 1, h: 1 } : null
+          }
           if (!runBtn) {
             const snip = ocr.lines.slice(0, 15).map(function (l) { return l.t }).join(' | ')
             throw new Error('run button (运行以上命令) not found after restart; ocr: ' + snip.slice(0, 300))
           }
         } else {
-          const snip = ocr.lines.slice(0, 15).map(function (l) { return l.t }).join(' | ')
-          throw new Error('run button (运行以上命令) not found; ocr: ' + snip.slice(0, 300))
+          // no restart left: try relative-position fallback before giving up
+          if (win) {
+            await pclickAt(win, Math.floor(win.w * 0.34), Math.floor(win.h * 0.73))
+            await ctx.timer.timeout(2500)
+            ocr = await ocrWindow(win)
+            const editorNow = findLine(ocr.lines, ['命令编辑器', '编辑器'])
+            if (editorNow) {
+              runBtn = { x: -1, y: -1, w: 1, h: 1 }
+            }
+          }
+          if (!runBtn) {
+            const snip = ocr.lines.slice(0, 15).map(function (l) { return l.t }).join(' | ')
+            throw new Error('run button (运行以上命令) not found; ocr: ' + snip.slice(0, 300))
+          }
         }
       }
 
@@ -634,77 +806,117 @@ return {
       let baseWindowCount = 0
       try {
         const ws = await listWindows()
-        baseWindowCount = ws.filter(function (w) { return w.visible && w.cls === 'SunAwtFrame' }).length
+        baseWindowCount = ws.filter(function (w) { return w.visible && w.cls.indexOf('SunAwt') === 0 }).length
       } catch (e) { /* ignore */ }
       const tRun = Math.floor(Date.now() / 1000)
       const baseTemp = await tempSnapshot(dir)
 
-      await clickAt(win, runBtn)
-
-      // a 提示/退出? dialog can pop up right after the run click and block
-      // the command; dismiss it and click run once more
+      let pinned = false
       try {
-        await ctx.timer.timeout(2500)
-        const modal = await findModalDialog()
-        if (modal) {
-          await dismissOne(modal)
-          await ctl(['fg', String(win.hwnd)], 10000)
-          await ctx.timer.timeout(800)
+        await pinTop(win.hwnd); pinned = true
+        await ctl(['fg', String(win.hwnd)], 10000)
+        await ctx.timer.timeout(600)
+        if (runBtn && runBtn.x >= 0) {
           await clickAt(win, runBtn)
+        } else {
+          await pclickAt(win, Math.floor(win.w * 0.34), Math.floor(win.h * 0.73))
         }
-      } catch (e) { /* ignore */ }
 
-      // poll the output region + figures + files
-      const t0 = Date.now()
-      const seen = {}
-      const order = []
-      let output = ''
-      let status = 'running'
-      while (Date.now() - t0 < timeoutMs) {
-        await ctx.timer.timeout(2500)
-        const o = await ocrWindow(win)
-        const region = o.lines.filter(function (l) { return l.y > o.rect.h * 0.8 && l.x < o.rect.w * 0.9 })
-        for (let i = 0; i < region.length; i++) {
-          const l = region[i]
-          const key = l.y + ':' + l.x
-          if (!seen[key]) {
-            seen[key] = true
-            order.push(l)
-          }
-        }
-        if (order.length > 0) {
-          output = order.map(function (l) { return l.t }).join('\n')
-        }
-        let newFigure = false
+        // a 提示/退出? dialog can pop up right after the run click and block
+        // the command; dismiss it and click run once more. Capture dialog text
+        // (may carry result data) into the output log.
+        let modalNote = ''
         try {
-          const ws = await listWindows()
-          const cnt = ws.filter(function (w) { return w.visible && w.cls === 'SunAwtFrame' }).length
-          newFigure = cnt > baseWindowCount
+          await ctx.timer.timeout(2500)
+          const modal = await findModalDialog()
+          if (modal) {
+            modalNote = modal.text
+            await dismissOne(modal.w)
+            await ctl(['fg', String(win.hwnd)], 10000)
+            await ctx.timer.timeout(800)
+            if (runBtn && runBtn.x >= 0) {
+              await clickAt(win, runBtn)
+            } else {
+              await pclickAt(win, Math.floor(win.w * 0.34), Math.floor(win.h * 0.73))
+            }
+          }
         } catch (e) { /* ignore */ }
-        let newTemp = false
-        const cur = await tempSnapshot(dir)
-        for (let i = 0; i < cur.length; i++) {
-          if (cur[i].mtime > tRun) { newTemp = true; break }
+
+        // poll the output region + figures + files + dialogs
+        const t0 = Date.now()
+        const seen = {}
+        const order = []
+        let output = ''
+        let status = 'running'
+        let lastGrowth = t0
+        const growExtendMs = 30000
+        let deadline = t0 + baseTimeout
+        while (Date.now() < deadline) {
+          await ctx.timer.timeout(2500)
+          const o = await ocrWindow(win)
+          const region = o.lines.filter(function (l) { return l.y > o.rect.h * 0.8 && l.x < o.rect.w * 0.9 })
+          let grew = false
+          for (let i = 0; i < region.length; i++) {
+            const l = region[i]
+            const key = l.y + ':' + l.x
+            if (!seen[key]) {
+              seen[key] = true
+              order.push(l)
+              grew = true
+            }
+          }
+          if (grew) {
+            lastGrowth = Date.now()
+            // output still growing -> extend the deadline (long tasks)
+            deadline = Math.max(deadline, Date.now() + growExtendMs)
+          }
+          if (order.length > 0) {
+            output = order.map(function (l) { return l.t }).join('\n')
+          }
+          let newFigure = false
+          try {
+            const ws = await listWindows()
+            const cnt = ws.filter(function (w) { return w.visible && w.cls.indexOf('SunAwt') === 0 }).length
+            newFigure = cnt > baseWindowCount
+          } catch (e) { /* ignore */ }
+          let newTemp = false
+          const cur = await tempSnapshot(dir)
+          for (let i = 0; i < cur.length; i++) {
+            if (cur[i].mtime > tRun) { newTemp = true; break }
+          }
+          const joined = norm(output)
+          const doneMark = /(已结束|完成|完毕|finished|done|succeed|success|错误|error|failed)/.test(joined)
+          if ((doneMark || newFigure || newTemp) && order.length >= 2) {
+            status = 'done'
+            break
+          }
+          // a small dialog (msgbox result) counts as completion; read it
+          const modal = await findModalDialog()
+          if (modal) {
+            status = 'done'
+            modalNote = modal.text
+            await dismissOne(modal.w)
+            break
+          }
+          if (wait === false) break
         }
-        const joined = norm(output)
-        const doneMark = /(已结束|完成|完毕|finished|done|succeed|success|错误|error|failed)/.test(joined)
-        if ((doneMark || newFigure || newTemp) && order.length >= 2) {
-          status = 'done'
-          break
+        if (status === 'running' && Date.now() >= deadline) status = 'timeout'
+        if (modalNote) {
+          output = (output ? output + '\n' : '') + '[dialog] ' + modalNote
         }
-        if (wait === false) break
-      }
-      if (status === 'running' && Date.now() - t0 >= timeoutMs) status = 'timeout'
-      try { await dismissDialogs() } catch (e) { /* ignore */ }
-      const lines = output.split('\n').filter(function (s) { return s.trim().length > 0 })
-      return {
-        status: status,
-        script: script,
-        output: lines.slice(-40).join('\n'),
-        lineCount: lines.length,
-        loaded: !!(result && result.loaded),
-        restarted: restartUsed,
-        window: win ? { hwnd: win.hwnd, title: win.title, x: win.x, y: win.y, w: win.w, h: win.h } : null
+        try { await dismissDialogs() } catch (e) { /* ignore */ }
+        const lines = output.split('\n').filter(function (s) { return s.trim().length > 0 })
+        return {
+          status: status,
+          script: script,
+          output: lines.slice(-40).join('\n'),
+          lineCount: lines.length,
+          loaded: !!(result && result.loaded),
+          restarted: restartUsed,
+          window: win ? { hwnd: win.hwnd, title: win.title, x: win.x, y: win.y, w: win.w, h: win.h } : null
+        }
+      } finally {
+        if (pinned && win) await unpinTop(win.hwnd)
       }
     }
 
@@ -783,16 +995,16 @@ return {
       return await writeScript(args.name, args.content)
     })
 
-    tool('matdem_run_script', 'Run a MatDEM script in the running MatDEM GUI. Automates: open the main program window, navigate the right-side file manager to the script (folders first, then the file row), double-click it so it loads into the command editor, click the 运行以上命令 button, then poll for completion. Completion is detected from the bottom message strip (输出消息), new figure windows, or TempModel/ files written after the run started. Note: disp/fprintf output of user code is NOT shown in the strip (only MatDEM app messages are); scripts should save results to files (e.g. print/saveas png, save .mat, fopen/fprintf) and the agent should check them with matdem_results. If the file manager listing is stale or the editor view is lost (result view/small mode), it restarts MatDEM once and retries. Use wait=false to start the run and return immediately; otherwise it polls until completion or timeoutMs (default 120000).', {
+    tool('matdem_run_script', 'Run a MatDEM script in the running MatDEM GUI. Automates: open the main program window, navigate the right-side file manager to the script (folders first, then the file row), double-click it so it loads into the command editor, click the 运行以上命令 button, then poll for completion. Completion is detected from the bottom message strip (输出消息), new figure windows, TempModel/ files written after the run started, or a small result dialog (SunAwtDialog, e.g. msgbox) whose OCR text is captured into the output. The main window is temporarily pinned to TOPMOST during the run to avoid occlusion by fullscreen/topmost browsers, then unpinned. Note: disp/fprintf output of user code is NOT shown in the strip (only MatDEM app messages are); scripts should save results to files (e.g. print/saveas png, save .mat, fopen/fprintf) and the agent should check them with matdem_results. If the file manager listing is stale or the editor view is lost (result view/small mode), it restarts MatDEM once and retries. Use wait=false to start the run and return immediately; otherwise it polls until completion or timeoutMs (default 900000 = 15 min; the deadline auto-extends while the output strip keeps growing).', {
       type: 'object',
       properties: {
         script: { type: 'string', description: 'relative path of the .m script, e.g. user_MySim.m or examples2025/user_TwoBallsHM.m' },
         wait: { type: 'boolean', description: 'poll until completion markers or timeout (default true)' },
-        timeoutMs: { type: 'integer', description: 'poll timeout in milliseconds (default 120000)' }
+        timeoutMs: { type: 'integer', description: 'poll timeout in milliseconds (default 900000)' }
       },
       required: ['script']
     }, async function (args) {
-      return await runScript(args.script, args.timeoutMs || 120000, args.wait !== false)
+      return await runScript(args.script, args.timeoutMs || 900000, args.wait !== false)
     })
 
     tool('matdem_output', 'Read the current text in the MatDEM output message strip (输出消息) at the bottom of the main window, via OCR of the live GUI. Use it to poll a long simulation started with matdem_run_script wait=false.', {
