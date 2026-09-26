@@ -113,6 +113,21 @@ matdem_results          # 检查结果文件（PNG / .mat / 文本）
 - 经验公式：Newmark 滑块法（输入加速度 + 临界加速度比 kc=0.15 双积分）；Jibson 简化式 Dn=10^(1.521-0.659log10(kc)-0.416log10(Ia))。
 - 动画：`d.figureNumber=1` 复用 Figure 1 + `getframe` 逐帧捕获 → `imwrite(...,'gif','WriteMode','append')` 存 GIF（`fs.movie2gif` 路径处理有坑，imwrite 更稳）。
 
+## 论文场景脚本模板库（templates/）
+
+从已验证的 `AI/user_LandslideEQ.m` 提炼的论文场景套用骨架（静态整理件；使用前须先做小规模冒烟；任何正式运行仍受授权与闸门约束）：
+
+| 文件 | 用途 |
+|---|---|
+| `templates/t01_box_slope_build.m` | 箱体建模 + 坡面雕刻（delElement）+ 弱土材料；全局参数区 `cfg` |
+| `templates/t02_seismic_drive.m` | 底部正弦位移驱动主循环（moveBoundary("bottom") + balance） |
+| `templates/t03_monitor_points.m` | 5 类监测点自动选取（顶/趾/中/心/肩） |
+| `templates/t04_result_export.m` | 结果 txt 报表（供 tools/matdem_result_summary.py 汇总） |
+| `templates/t05_figures_gif.m` | 6 子图分析图 + GIF 动画 |
+| `templates/t06_newmark_jibson.m` | Newmark 滑块位移 + Jibson 经验式对比 |
+| `templates/t99_assembly_example.m` | 拼接示例（一次 run 全流程） |
+
+详见 `templates/README.md`（含五个关键坑点与插件运行用法）。
 ## 环境要求
 
 - Windows + PowerShell 5.1（`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`）
