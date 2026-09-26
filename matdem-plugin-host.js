@@ -58,8 +58,9 @@ return {
       t = t.replace(/℃/g, 'c')
       t = t.replace(/＿/g, '_')
       t = t.replace(/[\uff10-\uff19]/g, function (ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xfee0) })
+      t = t.toLowerCase()
       t = t.replace(/[^a-z0-9._\-]/g, '')
-      return t.toLowerCase()
+      return t
     }
     const stripM = function (s) {
       return s.replace(/([\s_\-]*m)$/, '')
@@ -286,8 +287,9 @@ return {
       return null
     }
 
-    // find a file/folder row in the right file-manager panel (tree at y>12%h,
-    // file rows below). Exact (contains) matches win by longest text; otherwise
+    // find a file/folder row in the right file-manager panel (file rows start
+    // near the panel top, ~8%h in the current layout; skip the title band).
+    // Exact (contains) matches win by longest text; otherwise
     // a fuzzy (Levenshtein) fallback tolerates common OCR digit/letter
     // confusions (e.g. EQv5 read as EQv6, makeGIF read as makeGlF). Finally a
     // shared-substring fallback (>=6 chars) rescues heavily garbled rows such
@@ -300,7 +302,7 @@ return {
       for (let i = 0; i < ocr.lines.length; i++) {
         const l = ocr.lines[i]
         if (l.x < win.w * 0.78) continue
-        if (l.y < win.h * 0.12) continue
+        if (l.y < win.h * 0.03) continue
         const t = stripM(fileNorm(l.t))
         if (t.length < 4) continue
         const exact = nn.indexOf(t) >= 0 || t.indexOf(nn) >= 0
@@ -677,6 +679,17 @@ return {
       const baseShort = baseNorm.replace(/^user/, '')
       const baseTargets = [baseNorm, baseShort].filter(function (s) { return s.length >= 4 })
 
+      // Keep a copy for the command-editor fallback.  The file-manager path
+      // is preferred, but stale/virtualized panel rows can make a valid script
+      // invisible.  In that case the GUI editor can still receive the exact
+      // script through the plugin's clipboard primitives.
+      let scriptContent = null
+      try {
+        const scriptPath = await fsService.resolve(join(dir, rel.replace(/\//g, '\\')))
+        const scriptStat = await fsService.stat(scriptPath)
+        if (scriptStat && scriptStat.type === 'file') scriptContent = await fsService.readText(scriptPath)
+      } catch (e) { scriptContent = null }
+
       let win = null
       let ocr = null
       let restartUsed = false
@@ -720,6 +733,22 @@ return {
             row = findPanelRow(ocr, baseTargets[ti])
           }
           tries++
+        }
+        if (!row && scriptContent !== null) {
+          // C fallback: focus the command editor, replace its contents via
+          // clipboard, and verify that the editor remains visible.  This is
+          // deliberately limited to the no-row case and never bypasses the
+          // normal completion/output checks below.
+          try {
+            await pclickAt(win, Math.floor(win.w * 0.35), Math.floor(win.h * 0.45))
+            await ctl(['clip', scriptContent], 20000)
+            await ctl(['key', 'ctrl+a'], 10000)
+            await ctl(['paste'], 10000)
+            await ctx.timer.timeout(1200)
+            ocr = await ocrWindow(win)
+            const editor = findLine(ocr.lines, ['命令编辑器', '编辑器'])
+            if (editor) return { row: null, loaded: { x: -1, y: -1, w: 1, h: 1, via: 'clipboard' } }
+          } catch (e) { /* fall through to the normal error */ }
         }
         if (!row) throw new Error('script not visible in file manager: ' + base)
 
@@ -848,6 +877,8 @@ return {
         const order = []
         let output = ''
         let status = 'running'
+        let why = null
+        let figureDelta = 0
         let lastGrowth = t0
         const growExtendMs = 30000
         let deadline = t0 + baseTimeout
@@ -878,6 +909,7 @@ return {
             const ws = await listWindows()
             const cnt = ws.filter(function (w) { return w.visible && w.cls.indexOf('SunAwt') === 0 }).length
             newFigure = cnt > baseWindowCount
+            figureDelta = cnt - baseWindowCount
           } catch (e) { /* ignore */ }
           let newTemp = false
           const cur = await tempSnapshot(dir)
@@ -885,15 +917,17 @@ return {
             if (cur[i].mtime > tRun) { newTemp = true; break }
           }
           const joined = norm(output)
-          const doneMark = /(已结束|完成|完毕|finished|done|succeed|success|错误|error|failed)/.test(joined)
-          if ((doneMark || newFigure || newTemp) && order.length >= 2) {
+          const mDone = joined.match(/(已结束|完成|完毕|finished|done|succeed|success|错误|error|failed)/)
+          if ((mDone || newFigure || newTemp) && order.length >= 2) {
             status = 'done'
+            why = mDone ? ('doneMark:' + mDone[1]) : (newFigure ? 'newFigure' : 'newTemp')
             break
           }
           // a small dialog (msgbox result) counts as completion; read it
           const modal = await findModalDialog()
           if (modal) {
             status = 'done'
+            why = 'modal'
             modalNote = modal.text
             await dismissOne(modal.w)
             break
@@ -911,6 +945,8 @@ return {
           script: script,
           output: lines.slice(-40).join('\n'),
           lineCount: lines.length,
+          why: why,
+          figureDelta: figureDelta,
           loaded: !!(result && result.loaded),
           restarted: restartUsed,
           window: win ? { hwnd: win.hwnd, title: win.title, x: win.x, y: win.y, w: win.w, h: win.h } : null
